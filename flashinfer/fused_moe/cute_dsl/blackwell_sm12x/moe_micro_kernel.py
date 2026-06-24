@@ -336,6 +336,26 @@ def _threadfence(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_bf16x2(addr, val0_f32, val1_f32, *, loc=None, ip=None):
+    """Non-atomic BF16x2 store (two f32→bf16 packed into one 32-bit write)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val0_f32).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val1_f32).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 packed;"
+        " cvt.rn.satfinite.bf16x2.f32 packed, $2, $1;"
+        " st.global.u32 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
     return Int32(
         llvm.inline_asm(
@@ -2161,7 +2181,7 @@ class MoEMicroKernel:
                                     epi_buffer,
                                 ]
                             )
-                            scatter_add_bf16x2(
+                            st_global_bf16x2(
                                 get_ptr_as_int64(
                                     scatter_output, tok * scatter_N + global_col
                                 ),

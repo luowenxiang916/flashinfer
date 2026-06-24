@@ -506,7 +506,10 @@ def _get_static_kernel(
 
     # Select tile size based on actual routed rows
     routed_rows = m * num_topk
-    mma_tiler_mn = (128, 128)
+    # Default to wide N-tile (256) for better FC2 amortization when
+    # intermediate dim is large enough.  Halves output_tile_cnt, directly
+    # cutting FC2 sweep iterations and the associated TMA + scatter overhead.
+    mma_tiler_mn = (128, 256) if n >= 4096 else (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
         mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
 

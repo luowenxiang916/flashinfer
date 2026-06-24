@@ -316,6 +316,31 @@ def _threadfence(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_bf16x2(addr, val0_f32, val1_f32, *, loc=None, ip=None):
+    """Non-atomic BF16x2 store (two f32→bf16 packed into one 32-bit write).
+
+    Replaces scatter_add_bf16x2 when the output is pre-zeroed and each
+    position is written exactly once (no contention).  Eliminates the
+    atomic read-modify-write cycle at L2.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val0_f32).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val1_f32).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 packed;"
+        " cvt.rn.satfinite.bf16x2.f32 packed, $2, $1;"
+        " st.global.u32 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
     return Int32(
         llvm.inline_asm(
@@ -566,6 +591,33 @@ class MoEStaticKernel:
             self.ab_stage -= 1
             while self.ab_stage > 1 and 32 % self.ab_stage != 0:
                 self.ab_stage -= 1
+
+        # Try double-buffered epilogue (epi_stage=2) for better FC2 scatter
+        # bandwidth by avoiding read-after-write stalls on the same sC buffer.
+        # Only enabled if it fits without sacrificing ab_stage or occupancy.
+        for _epi_try in (2,):
+            self.epi_stage = _epi_try
+            (
+                _,
+                _,
+                _,
+                _,
+                _try_epi_layout,
+            ) = self._make_staged_layouts(self.ab_stage)
+            if (
+                self._shared_storage_size_bytes(
+                    self.a_smem_layout_staged,
+                    self.b_smem_layout_staged,
+                    self.sfa_smem_layout_staged,
+                    self.sfb_smem_layout_staged,
+                    _try_epi_layout,
+                )
+                <= self.smem_capacity
+            ):
+                self.epi_smem_layout_staged = _try_epi_layout
+                break
+        else:
+            self.epi_stage = 1
 
     @cute.jit
     def _resident_grid_barrier(
@@ -1059,6 +1111,17 @@ class MoEStaticKernel:
                     gs_value = rcp_approx_ftz(gs_value)
                 else:
                     gs_value = cutlass.Float32(1.0) / gs_value
+            # Hoist row-based scale address components out of the sf_idx loop.
+            # row is fixed for the entire pair — only sf_idx changes.
+            p1_m_tile_idx = row // Int32(32 * 4)
+            p1_outer_m_idx = row % Int32(32)
+            p1_inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
+            p1_scale_row_base = (
+                local_expert_id * expert_scale_stride
+                + p1_m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                + p1_outer_m_idx * Int32(4 * 4)
+                + p1_inner_m_idx * Int32(4)
+            )
             sf_idx = Int32(tidx)
             while sf_idx < sf_blocks_per_row:
                 block_start = sf_idx * Int32(16)
@@ -1090,17 +1153,11 @@ class MoEStaticKernel:
                     get_ptr_as_int64(packed_a_storage, output_offset), packed64
                 )
 
-                m_tile_idx = row // Int32(32 * 4)
                 k_tile_idx = sf_idx // Int32(4)
-                outer_m_idx = row % Int32(32)
-                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
                 inner_k_idx = sf_idx % Int32(4)
                 scale_offset = (
-                    local_expert_id * expert_scale_stride
-                    + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                    p1_scale_row_base
                     + k_tile_idx * Int32(32 * 4 * 4)
-                    + outer_m_idx * Int32(4 * 4)
-                    + inner_m_idx * Int32(4)
                     + inner_k_idx
                 )
                 scale_storage[scale_offset] = scale_byte
@@ -1362,6 +1419,52 @@ class MoEStaticKernel:
                 )
             )
 
+            # ----------------------------------------------------------------
+            # Hoist loop-invariant epilogue setup outside the work-tile loop.
+            # These values depend only on kernel parameters (layouts, dtypes,
+            # tiled_mma) which are fixed for the lifetime of the MMA warp group.
+            # ----------------------------------------------------------------
+            _is_m_major = self.c_layout.is_m_major_c()
+            copy_atom_r2s = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.BFloat16,
+            )
+            copy_atom_C = cute.make_copy_atom(
+                cute.nvgpu.warp.StMatrix8x8x16bOp(_is_m_major, 2),
+                cutlass.BFloat16,
+            )
+            tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+            tiled_copy_r2s = cute.make_tiled_copy_S(
+                copy_atom_r2s, tiled_copy_C_Atom
+            )
+            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+            tRS_sD = thr_copy_r2s.partition_D(sC)
+            tRS_rGate = tiled_copy_r2s.retile(gate_acc)
+            tRS_rUp = tiled_copy_r2s.retile(up_acc)
+            rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+            tRS_rD_layout = cute.make_layout(rD_shape[:3])
+            tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+            tRS_rD_out = cute.make_rmem_tensor(
+                tRS_rD_layout.shape, cutlass.BFloat16
+            )
+            mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rGate, mode=[1])
+            mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rGate, mode=[2])
+            epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
+            MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
+            MmaNPerEpiN = self.epi_tile[1] // mma_tile_n
+
+            # Quant-path constants (sA_u8 base address changes with sA but the
+            # packed_cols and per-tile sf_blocks_per_row are fixed).
+            packed_cols_quant = Int32(self.tile_shape_mnk[2] // 2)
+            sf_blocks_per_row_quant = Int32(self.tile_shape_mnk[2] // 16)
+
+            # FC2 scatter constants: all thread-local, depend only on tidx.
+            scatter_N = Int32(scatter_output.shape[1])
+            lane_id = Int32(tidx) & Int32(31)
+            warp_in_tile = Int32(tidx) >> Int32(5)
+            warp_m_base = (warp_in_tile >> Int32(1)) * Int32(64)
+            warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
+
             while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
@@ -1454,42 +1557,9 @@ class MoEStaticKernel:
                     _st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
                 self.epilog_sync_barrier.arrive_and_wait()
 
-                _is_m_major = self.c_layout.is_m_major_c()
-                copy_atom_r2s = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
-                    cutlass.BFloat16,
-                )
-                copy_atom_C = cute.make_copy_atom(
-                    cute.nvgpu.warp.StMatrix8x8x16bOp(_is_m_major, 2),
-                    cutlass.BFloat16,
-                )
-                tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
-                tiled_copy_r2s = cute.make_tiled_copy_S(
-                    copy_atom_r2s, tiled_copy_C_Atom
-                )
-
-                thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-                tRS_sD = thr_copy_r2s.partition_D(sC)
-                tRS_rGate = tiled_copy_r2s.retile(gate_acc)
-                tRS_rUp = tiled_copy_r2s.retile(up_acc)
-
-                rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
-                tRS_rD_layout = cute.make_layout(rD_shape[:3])
-                tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
-                tRS_rD_out = cute.make_rmem_tensor(
-                    tRS_rD_layout.shape, cutlass.BFloat16
-                )
-
-                mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rGate, mode=[1])
-                mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rGate, mode=[2])
                 epi_buffer = Int32(0)
-
                 down_alpha_value = down_alpha[weight_expert_idx].to(cutlass.Float32)
                 down_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
-
-                epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
-                MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
-                MmaNPerEpiN = self.epi_tile[1] // mma_tile_n
 
                 # ============================================================
                 # PHASE A: FC1 for this slice (gate + up)
@@ -1749,8 +1819,6 @@ class MoEStaticKernel:
 
                 # Activation + quant into sA
                 sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
-                packed_cols = Int32(self.tile_shape_mnk[2] // 2)
-                sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
                 gs_value = global_scale[weight_expert_idx].to(cutlass.Float32)
                 if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
                     0.0
@@ -1815,11 +1883,16 @@ class MoEStaticKernel:
                         epi_rows = Int32(self.epi_tile[0])
                     if epi_rows < Int32(0):
                         epi_rows = Int32(0)
+                    quant_total = epi_rows * sf_blocks_per_row_quant
                     quant_idx = Int32(tidx)
-                    while quant_idx < epi_rows * sf_blocks_per_row:
-                        local_row = quant_idx // sf_blocks_per_row
+                    # Compute starting (local_row, sf_block) once; advance
+                    # without integer division inside the hot loop.
+                    q_local_row = quant_idx // sf_blocks_per_row_quant
+                    q_sf_block = quant_idx - q_local_row * sf_blocks_per_row_quant
+                    while quant_idx < quant_total:
+                        local_row = q_local_row
                         row = sa_row_base + rows_offset + local_row
-                        sf_block = quant_idx - local_row * sf_blocks_per_row
+                        sf_block = q_sf_block
                         block_start = sf_block * Int32(16)
 
                         values = cute.make_rmem_tensor((16,), cutlass.Float32)
@@ -1848,7 +1921,7 @@ class MoEStaticKernel:
                         for byte_idx in cutlass.range_constexpr(8):
                             src_pcol = packed_base + Int32(byte_idx)
                             dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
-                            dst_flat = dst_row * packed_cols + dst_pcol
+                            dst_flat = dst_row * packed_cols_quant + dst_pcol
                             byte_val = Uint8(
                                 (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
                             )
@@ -1868,6 +1941,12 @@ class MoEStaticKernel:
                         quant_idx += Int32(
                             self.num_mma_warps * self.num_threads_per_warp
                         )
+                        q_sf_block += Int32(
+                            self.num_mma_warps * self.num_threads_per_warp
+                        )
+                        while q_sf_block >= sf_blocks_per_row_quant:
+                            q_sf_block -= sf_blocks_per_row_quant
+                            q_local_row += Int32(1)
 
                 cute.arch.fence_proxy("async.shared", space="cta")
                 # epilog_sync: MMA-only barrier. DMA warp doesn't need to wait
@@ -1882,13 +1961,9 @@ class MoEStaticKernel:
                 # and DMA's B_down loads into sB/sSFB don't conflict with
                 # MMA's SiLU+quant on sC/sA/sSFA. The phase2_pipeline
                 # handles B_down availability for FC2 GEMM.
+                # scatter_N / lane_id / warp_m_base / warp_n_base are
+                # loop-invariant; hoisted outside the work-tile loop above.
                 # ============================================================
-                scatter_N = Int32(scatter_output.shape[1])
-                lane_id = Int32(tidx) & Int32(31)
-                warp_in_tile = Int32(tidx) >> Int32(5)
-                warp_m_base = (warp_in_tile >> Int32(1)) * Int32(64)
-                warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
-
                 csA_phase2 = csA_tile[None, None, None, 0]
                 csSFA_phase2 = csSFA_tile[None, None, None, 0]
 
@@ -2014,7 +2089,14 @@ class MoEStaticKernel:
                         acc_vec = tRS_rD.load()
                         acc_vec = acc_vec.to(cutlass.BFloat16)
                         tRS_rD_out.store(acc_vec)
-                        epi_buffer = Int32(epi_m) % cute.size(tRS_sD, mode=[3])
+                        if cutlass.const_expr(self.epi_stage > 1):
+                            epi_buffer = Int32(output_tile_idx) % Int32(
+                                self.epi_stage
+                            )
+                        else:
+                            epi_buffer = Int32(epi_m) % cute.size(
+                                tRS_sD, mode=[3]
+                            )
                         cute.copy(
                             tiled_copy_r2s,
                             tRS_rD_out,
@@ -2074,7 +2156,7 @@ class MoEStaticKernel:
                                     epi_buffer,
                                 ]
                             )
-                            scatter_add_bf16x2(
+                            st_global_bf16x2(
                                 get_ptr_as_int64(
                                     scatter_output, tok * scatter_N + global_col
                                 ),
