@@ -2130,9 +2130,16 @@ class MoEMicroKernel:
 
                         rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
-                        # Per-warp scatter: each warp scatters its own quadrant
-                        # of sC (64 M-rows x 64 N-cols). No cross-warp read
-                        # dependencies, so no pre-scatter barrier is needed.
+                        # Per-warp scatter (coalesced rewrite — scheme B).
+                        # Original: pair_idx flat loop, each lane handles the
+                        #   same col for all rows → lane 0 loads tok/wv, rest
+                        #   broadcast via 2× shuffle_sync per row → ~128 shuffles
+                        #   per warp per epi tile.
+                        # New: outer loop over rows (stride 1), all 32 lanes load
+                        #   the same tok/wv directly from smem (L1 broadcast, no
+                        #   shuffle), then each lane writes its lane_id-th pair_col
+                        #   of that row → 32 lanes × 2 bf16 = 64 consecutive bytes
+                        #   to the same token → fully coalesced, zero shuffle cost.
                         warp_epi_rows = (
                             valid_rows - tile_m_base - rows_offset - warp_m_base
                         )
@@ -2141,15 +2148,15 @@ class MoEMicroKernel:
                         if warp_epi_rows < Int32(0):
                             warp_epi_rows = Int32(0)
 
-                        pair_idx = lane_id
-                        while pair_idx < warp_epi_rows * Int32(32):
-                            local_row = pair_idx >> Int32(5)  # / 32
-                            local_pair_col = pair_idx & Int32(31)  # % 32
-                            global_col = (
-                                tile_n_base_cur
-                                + warp_n_base
-                                + local_pair_col * Int32(2)
-                            )
+                        # lane_id selects which pair_col this lane writes;
+                        # global_col is loop-invariant for this epi tile.
+                        global_col = (
+                            tile_n_base_cur
+                            + warp_n_base
+                            + lane_id * Int32(2)
+                        )
+                        local_row = Int32(0)
+                        while local_row < warp_epi_rows:
                             cached_row = rows_offset + warp_m_base + local_row
                             tok = Int32(0)
                             wv = cutlass.Float32(0.0)
@@ -2157,27 +2164,25 @@ class MoEMicroKernel:
                                 tok = unique_tok
                                 wv = unique_wv
                             else:
-                                # Only lane 0 loads tok/wv from smem; broadcast via shuffle.
-                                if lane_id == Int32(0):
-                                    tok = _ld_shared_i32(
-                                        scatter_tok_base_addr + cached_row * Int32(4)
-                                    )
-                                    wv = _ld_shared_f32(
-                                        scatter_weight_base_addr + cached_row * Int32(4)
-                                    )
-                                tok = cute.arch.shuffle_sync(tok, Int32(0))
-                                wv = cute.arch.shuffle_sync(wv, Int32(0))
+                                # Every lane reads the same smem address —
+                                # hardware coalesces into a single broadcast.
+                                tok = _ld_shared_i32(
+                                    scatter_tok_base_addr + cached_row * Int32(4)
+                                )
+                                wv = _ld_shared_f32(
+                                    scatter_weight_base_addr + cached_row * Int32(4)
+                                )
                             sc_v0 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2),
+                                    warp_n_base + lane_id * Int32(2),
                                     epi_buffer,
                                 ]
                             )
                             sc_v1 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2) + Int32(1),
+                                    warp_n_base + lane_id * Int32(2) + Int32(1),
                                     epi_buffer,
                                 ]
                             )
@@ -2188,7 +2193,7 @@ class MoEMicroKernel:
                                 wv * sc_v0,
                                 wv * sc_v1,
                             )
-                            pair_idx += Int32(self.num_threads_per_warp)
+                            local_row += Int32(1)
 
                         # Post-scatter barrier: needed to ensure all warps
                         # finish scatter before next output tile's pipeline ops
